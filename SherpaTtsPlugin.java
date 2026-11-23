@@ -47,6 +47,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * Models live inside the APK:   assets/voices/<voiceId>/<voiceId>.onnx  +  tokens.txt
  * Shared phonemizer data:       assets/voices/espeak-ng-data/   (copied once to filesDir, because espeak needs real files)
  *
+ * FIX (v2): because espeak needs a real dataDir on disk, sherpa must be created with a NULL AssetManager
+ * and read model + tokens + espeak-ng-data ALL from the file system. So the model and tokens are now
+ * also copied once to filesDir/voices/<voiceId>/.
+ *
  * JS API (window.Capacitor.Plugins.SherpaTts):
  *   status()                      -> what is in the APK, native library state
  *   selfTest({voice,text})        -> load + synthesize (no playback), timings, peak amplitude
@@ -176,6 +180,32 @@ public class SherpaTtsPlugin extends Plugin {
         return espeakDir;
     }
 
+    /**
+     * Model and tokens are copied to filesDir/voices/<id>/ once. With a real espeak dataDir on disk,
+     * sherpa must read EVERYTHING from the file system (AssetManager = null), not from APK assets.
+     * Each file is written to a .tmp first and renamed, so a half-finished copy is never used.
+     */
+    private synchronized File ensureVoiceFiles(String id) throws VoiceErr {
+        File dir = new File(getContext().getFilesDir(), "voices/" + id);
+        AssetManager am = getContext().getAssets();
+        try {
+            dir.mkdirs();
+            for (String n : new String[]{id + ".onnx", "tokens.txt"}) {
+                File f = new File(dir, n);
+                if (f.isFile() && f.length() > 0) continue;
+                File tmp = new File(dir, n + ".tmp");
+                if (tmp.exists()) tmp.delete();
+                copyAssetDir(am, "voices/" + id + "/" + n, tmp);
+                if (!tmp.isFile() || tmp.length() == 0) throw new IOException("copy of " + n + " is empty");
+                if (f.exists()) f.delete();
+                if (!tmp.renameTo(f)) throw new IOException("cannot rename " + n);
+            }
+        } catch (IOException e) {
+            throw new VoiceErr("NO_ASSET", "voice copy: " + e.getMessage());
+        }
+        return dir;
+    }
+
     private synchronized OfflineTts load(String id) throws VoiceErr {
         OfflineTts t = engines.get(id);
         if (t != null) return t;
@@ -188,10 +218,11 @@ public class SherpaTtsPlugin extends Plugin {
             if (!assetExists(am, p)) throw new VoiceErr("NO_ASSET", p);
         }
         String espeak = ensureEspeak();
+        File vd = ensureVoiceFiles(id);
         try {
             OfflineTtsVitsModelConfig v = new OfflineTtsVitsModelConfig();
-            v.setModel(model);
-            v.setTokens(tokens);
+            v.setModel(new File(vd, id + ".onnx").getAbsolutePath());
+            v.setTokens(new File(vd, "tokens.txt").getAbsolutePath());
             v.setDataDir(espeak);
             v.setNoiseScale(0.667f);
             v.setNoiseScaleW(0.8f);
@@ -204,7 +235,7 @@ public class SherpaTtsPlugin extends Plugin {
             OfflineTtsConfig c = new OfflineTtsConfig();
             c.setModel(m);
             c.setMaxNumSentences(1);
-            t = new OfflineTts(am, c);
+            t = new OfflineTts((AssetManager) null, c);   /* null = read everything from real files */
         } catch (Throwable e) {
             String why = e.getClass().getSimpleName() + ": " + e.getMessage();
             throw new VoiceErr(e instanceof LinkageError ? "NATIVE_LIB" : "INIT_FAIL", why);
@@ -406,7 +437,7 @@ public class SherpaTtsPlugin extends Plugin {
         o.put("espeakInApk", assetExists(am, "voices/espeak-ng-data/phondata"));
         File root = getContext().getFilesDir();
         o.put("espeakCopied", new File(root, ESPEAK_MARK).exists() && new File(root, "espeak-ng-data").isDirectory());
-        o.put("storage", "APK assets (read-only) + filesDir/espeak-ng-data (app files dir)");
+        o.put("storage", "APK assets (read-only) + filesDir/espeak-ng-data + filesDir/voices (app files dir)");
         call.resolve(o);
     }
 
