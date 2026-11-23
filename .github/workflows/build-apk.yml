@@ -202,6 +202,7 @@ jobs:
           cp "dl/$EN_BUNDLE/$EN_VOICE.onnx" "dl/$EN_BUNDLE/tokens.txt" "$V/$EN_VOICE/"
           cp -r "dl/$HI_BUNDLE/espeak-ng-data" "$V/espeak-ng-data"
           du -sh "$V"/* | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ESPEAK_FILES=$(find "$V/espeak-ng-data" -type f | wc -l)" >> "$GITHUB_ENV"
           rm -rf dl *.tar.bz2
 
       - name: Add sherpa-onnx Android library and the native SherpaTts plugin
@@ -288,6 +289,9 @@ jobs:
                    lib/arm64-v8a/libsherpa-onnx-jni.so lib/armeabi-v7a/libsherpa-onnx-jni.so AndroidManifest.xml; do
             grep -q "$f" /tmp/apk.txt || { echo "::error::Missing inside APK: $f"; exit 1; }
           done
+          APK_ESPEAK=$(awk '{print $4}' /tmp/apk.txt | grep "^assets/voices/espeak-ng-data/" | grep -vc '/$' || true)
+          echo "espeak files: source=$ESPEAK_FILES inside APK=$APK_ESPEAK" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$APK_ESPEAK" = "$ESPEAK_FILES" ] || { echo "::error::espeak-ng-data files were dropped while packaging the APK ($ESPEAK_FILES -> $APK_ESPEAK)"; exit 1; }
           unzip -p "$APK" 'classes*.dex' | strings | grep -q "SherpaTtsPlugin" || { echo "::error::SherpaTtsPlugin class is not in the APK dex"; exit 1; }
           {
             echo "### APK"
