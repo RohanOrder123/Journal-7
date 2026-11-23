@@ -193,8 +193,6 @@ public class SherpaTtsPlugin extends Plugin {
             v.setModel(model);
             v.setTokens(tokens);
             v.setDataDir(espeak);
-            v.setLexicon("");
-            v.setDictDir("");
             v.setNoiseScale(0.667f);
             v.setNoiseScaleW(0.8f);
             v.setLengthScale(1.0f);
