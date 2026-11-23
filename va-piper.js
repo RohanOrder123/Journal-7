@@ -151,6 +151,7 @@
       try {
         const r = await withTimeout(pl.selfTest({ voice: VOICES[c], text: c === 'hi' ? 'नमस्ते रोहन जी, मैं वेदा हूँ। आपकी आवाज़ की जाँच हो रही है।' : 'Hello Rohan ji, this is a voice check.' }), 60000, c);
         (r.ok ? ok : bad)(VOICES[c] + ': init ' + r.initMs + ' ms, synth ' + r.synthMs + ' ms, audio ' + r.audioSec + ' s, RTF ' + r.rtf + ', peak ' + r.peak + ', ' + r.sampleRate + ' Hz' + (r.ok ? '' : '  (silent or empty audio!)'));
+        if (!r.ok && r.diag) { info('diag: engineSR=' + r.diag.engineSampleRate + ' speakers=' + r.diag.numSpeakers + ' lang=' + r.diag.lang + ' audioSR=' + r.diag.audioSampleRate); info('espeak files in APK=' + r.diag.espeakFilesInApk + ' copied=' + r.diag.espeakFilesCopied + ' dir=' + r.diag.espeakDir); info('espeak top: ' + r.diag.espeakTop); String(r.diag.log || '').split('\n').forEach(function (x) { if (x) info('log> ' + x); }); }
       } catch (e) { bad(VOICES[c] + ': ' + (e && e.code || '') + ' ' + (e && e.message || e)); }
     }
     out.push('');
