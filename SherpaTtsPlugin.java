@@ -19,11 +19,13 @@ import com.k2fsa.sherpa.onnx.OfflineTtsConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -199,7 +201,7 @@ public class SherpaTtsPlugin extends Plugin {
             OfflineTtsModelConfig m = new OfflineTtsModelConfig();
             m.setVits(v);
             m.setNumThreads(2);
-            m.setDebug(false);
+            m.setDebug(true);   /* diagnostic build: sherpa prints its own errors to logcat, which selfTest reads back */
             m.setProvider("cpu");
             OfflineTtsConfig c = new OfflineTtsConfig();
             c.setModel(m);
@@ -309,6 +311,67 @@ public class SherpaTtsPlugin extends Plugin {
         return o;
     }
 
+
+    /* ------------------------------------------------------------ diagnostics */
+
+    private int countAssets(AssetManager am, String path) {
+        try {
+            String[] l = am.list(path);
+            if (l == null || l.length == 0) return assetExists(am, path) ? 1 : 0;
+            int c = 0;
+            for (String n : l) c += countAssets(am, path + "/" + n);
+            return c;
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+
+    private static int countFiles(File f) {
+        if (f == null || !f.exists()) return 0;
+        if (f.isFile()) return 1;
+        File[] k = f.listFiles();
+        int c = 0;
+        if (k != null) for (File x : k) c += countFiles(x);
+        return c;
+    }
+
+    /** The app may read its OWN logcat lines. sherpa-onnx / espeak print the real reason for a failure there. */
+    private String sherpaLog() {
+        try {
+            Process pr = Runtime.getRuntime().exec(new String[]{"logcat", "-d", "-t", "600"});
+            BufferedReader r = new BufferedReader(new InputStreamReader(pr.getInputStream()));
+            List<String> keep = new ArrayList<>();
+            String line;
+            while ((line = r.readLine()) != null) {
+                String low = line.toLowerCase();
+                if (low.contains("sherpa") || low.contains("espeak") || low.contains("piper") || low.contains("phonem") || low.contains("onnx")) keep.add(line);
+            }
+            StringBuilder b = new StringBuilder();
+            for (int i = Math.max(0, keep.size() - 25); i < keep.size(); i++) b.append(keep.get(i)).append('\n');
+            return b.length() == 0 ? "(no sherpa/espeak lines in logcat)" : b.toString();
+        } catch (Throwable e) {
+            return "(logcat not readable: " + e + ")";
+        }
+    }
+
+    private JSObject diag(OfflineTts t, GeneratedAudio a) {
+        JSObject d = new JSObject();
+        AssetManager am = getContext().getAssets();
+        try { d.put("engineSampleRate", t.sampleRate()); } catch (Throwable e) { d.put("engineSampleRate", "err " + e); }
+        try { d.put("numSpeakers", t.numSpeakers()); } catch (Throwable e) { d.put("numSpeakers", "err " + e); }
+        try { d.put("lang", String.valueOf(t.lang())); } catch (Throwable e) { d.put("lang", "err " + e); }
+        d.put("audioSampleRate", a.getSampleRate());
+        d.put("espeakFilesInApk", countAssets(am, "voices/espeak-ng-data"));
+        d.put("espeakFilesCopied", countFiles(new File(getContext().getFilesDir(), "espeak-ng-data")));
+        d.put("espeakDir", String.valueOf(espeakDir));
+        File[] top = new File(getContext().getFilesDir(), "espeak-ng-data").listFiles();
+        StringBuilder b = new StringBuilder();
+        if (top != null) for (File f : top) b.append(f.getName()).append(f.isDirectory() ? "/" : "").append(' ');
+        d.put("espeakTop", b.toString().trim());
+        d.put("log", sherpaLog());
+        return d;
+    }
+
     /* ------------------------------------------------------------ plugin API */
 
     @PluginMethod
@@ -392,6 +455,7 @@ public class SherpaTtsPlugin extends Plugin {
                 o.put("sampleRate", a.getSampleRate());
                 o.put("peak", Math.round(peak * 1000) / 1000.0);
                 o.put("rtf", secs > 0 ? Math.round(genMs / 1000.0 / secs * 100) / 100.0 : -1);
+                if (!o.getBool("ok")) o.put("diag", diag(t, a));
                 call.resolve(o);
             } catch (VoiceErr e) {
                 call.reject(e.getMessage(), e.code);
