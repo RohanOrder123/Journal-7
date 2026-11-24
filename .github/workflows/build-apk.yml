@@ -403,7 +403,7 @@ jobs:
             echo "### APK"
             echo "- size: $((SIZE/1048576)) MB"
             echo '- biggest entries:'; echo '```'
-            unzip -lv "$APK" | sort -k1 -n -r | head -8
+            (unzip -lv "$APK" | sort -k1 -n -r | head -8) || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           keytool -printcert -jarfile "$APK" 2>&1 | grep -E "Owner|SHA256" | tee -a "$GITHUB_STEP_SUMMARY" || true
@@ -412,10 +412,15 @@ jobs:
           if [ -n "$APKSIGNER" ]; then
             "$APKSIGNER" verify --print-certs "$APK" > /tmp/sign.txt 2>&1 || { cat /tmp/sign.txt; echo "::error::APK signature does not verify"; exit 1; }
             GOT=$(grep -i "certificate SHA-256 digest" /tmp/sign.txt | head -1 | sed 's/.*: *//' | tr -d ': ' | tr 'A-F' 'a-f')
-            WANT=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android 2>/dev/null | grep -m1 "SHA256:" | sed 's/.*SHA256: *//' | tr -d ': ' | tr 'A-F' 'a-f')
+            KS=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android 2>/dev/null || true)
+            echo "keystore entries:" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "$KS" | grep -E "Alias name|SHA256:" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            WANT=$(echo "$KS" | grep "SHA256:" | sed 's/.*SHA256: *//' | tr -d ': ' | tr 'A-F' 'a-f')
             echo "APK signer sha256: $GOT" | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "rc-debug.keystore sha256: $WANT" | tee -a "$GITHUB_STEP_SUMMARY"
-            if [ -n "$GOT" ] && [ -n "$WANT" ] && [ "$GOT" != "$WANT" ]; then echo "::error::APK is NOT signed with rc-debug.keystore - it would not update your old APK"; exit 1; fi
+            if [ -n "$GOT" ] && [ -n "$WANT" ]; then
+              echo "$WANT" | grep -qx "$GOT" || { echo "::error::APK signer is not any key in rc-debug.keystore - it would not update your old APK"; exit 1; }
+              echo "Signer fingerprint matches a key in rc-debug.keystore." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
             { [ -z "$GOT" ] || [ -z "$WANT" ]; } && echo "::warning::could not compare signing fingerprints automatically"
           else
             echo "::warning::apksigner not found on the runner - signature fingerprint check skipped"
