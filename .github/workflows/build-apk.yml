@@ -11,9 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SHERPA_VERSION: "2.0.3"
-  SHERPA_AAR: sherpa-onnx-static-link-onnxruntime-2.0.3.aar
-  SHERPA_AAR_BYTES: "39999115"
+  # sherpa-onnx 1.13.8 = last line that still contains the built-in eSpeak-NG / Piper phonemizer (removed in 2.0.0)
+  SHERPA_VERSION: "1.13.8"
+  SHERPA_AAR: sherpa-onnx-static-link-onnxruntime-1.13.8.aar
+  # Optional: paste the sha256 shown in the "Sherpa AAR" step summary here to pin the file for future builds. Empty = not pinned.
+  SHERPA_AAR_SHA256: ""
   MODELS_URL: https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models
   HI_VOICE: hi_IN-priyamvada-medium
   HI_BUNDLE: vits-piper-hi_IN-priyamvada-medium
@@ -67,6 +69,9 @@ jobs:
           if [ "$missing" = "1" ]; then exit 1; fi
           grep -q "voice-bridge.js" index.html || echo "::warning::index.html has no voice-bridge.js script tag - native mic / phone voice will not work"
           grep -q "va-piper.js" index.html || { echo "::error::index.html does not load va-piper.js"; exit 1; }
+          # the plugin must be the sherpa 1.x version (it announces its target version in the file)
+          grep -q 'TARGET_SHERPA = "1.13.8"' SherpaTtsPlugin.java || { echo "::error::SherpaTtsPlugin.java in the repo is not the 1.13.8 version - upload the new file"; exit 1; }
+          grep -q "^package com.rohanchauhan.tradesjournal;" SherpaTtsPlugin.java || { echo "::error::SherpaTtsPlugin.java has a wrong package line"; exit 1; }
           echo "All required files present."
 
       - name: Install dependencies (locked if package-lock.json exists)
@@ -205,16 +210,104 @@ jobs:
           echo "ESPEAK_FILES=$(find "$V/espeak-ng-data" -type f | wc -l)" >> "$GITHUB_ENV"
           rm -rf dl *.tar.bz2
 
+      # ------------------------------------------------------------------
+      # Host-side synthesis test with the SAME sherpa-onnx 1.13.8 core + the SAME model files that go into the APK.
+      # This is a proxy for the phone (Linux, not Android), but it proves the two Piper voices phonemize and
+      # synthesize under 1.13.8. It FAILS the build if a voice produces no audio.
+      # If the Python wheel itself cannot be installed (network / no wheel), the test is SKIPPED with a warning.
+      # ------------------------------------------------------------------
+      - name: Synthesis test on the runner (Hindi + English, sherpa-onnx 1.13.8)
+        run: |
+          V=android/app/src/main/assets/voices
+          cat > /tmp/synth_test.py <<'PY'
+          import sys, struct, math
+          import sherpa_onnx
+          V = sys.argv[1]; HI = sys.argv[2]; EN = sys.argv[3]
+          HI_TEXT = "\u0928\u092e\u0938\u094d\u0924\u0947 \u0930\u094b\u0939\u0928 \u091c\u0940, \u092e\u0948\u0902 \u0935\u0947\u0926\u093e \u0939\u0942\u0901\u0964 \u092f\u0939 \u0939\u093f\u0902\u0926\u0940 \u0906\u0935\u093e\u091c\u093c \u0915\u093e \u092a\u0930\u0940\u0915\u094d\u0937\u0923 \u0939\u0948\u0964"
+          EN_TEXT = "Hello Rohan ji, this is an offline English voice test."
+          print("sherpa_onnx version:", getattr(sherpa_onnx, "__version__", "unknown"))
+          bad = 0
+          for vid, text in ((HI, HI_TEXT), (EN, EN_TEXT)):
+              cfg = sherpa_onnx.OfflineTtsConfig(
+                  model=sherpa_onnx.OfflineTtsModelConfig(
+                      vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                          model=f"{V}/{vid}/{vid}.onnx",
+                          tokens=f"{V}/{vid}/tokens.txt",
+                          data_dir=f"{V}/espeak-ng-data"),
+                      num_threads=2, debug=False, provider="cpu"),
+                  max_num_sentences=1)
+              tts = sherpa_onnx.OfflineTts(cfg)
+              a = tts.generate(text, sid=0, speed=1.0)
+              n = len(a.samples); sr = a.sample_rate
+              peak = max((abs(x) for x in a.samples), default=0.0)
+              dur = n / sr if sr else 0
+              ok = n > 0 and sr > 0 and dur > 0 and peak > 0.01
+              line = f"{vid}: samples={n} sampleRate={sr} duration={dur:.2f}s peak={peak:.3f} -> {'PASS' if ok else 'FAIL'}"
+              print(line)
+              with open("/tmp/synth_summary.txt", "a") as f: f.write("- " + line + "\n")
+              if not ok: bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+          if pip install --quiet "sherpa-onnx==$SHERPA_VERSION"; then
+            echo "### Synthesis test (runner, sherpa-onnx $SHERPA_VERSION)" >> "$GITHUB_STEP_SUMMARY"
+            rm -f /tmp/synth_summary.txt
+            if python3 /tmp/synth_test.py "$V" "$HI_VOICE" "$EN_VOICE" 2>&1 | tee /tmp/synth.log; then :; fi
+            [ -f /tmp/synth_summary.txt ] && cat /tmp/synth_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            if grep -q "FAIL" /tmp/synth.log || ! grep -q "$EN_VOICE: samples" /tmp/synth.log || ! grep -q "$HI_VOICE: samples" /tmp/synth.log; then
+              echo "::error::Piper synthesis test FAILED under sherpa-onnx $SHERPA_VERSION - see the log above (send it to Claude)"; exit 1
+            fi
+            echo "Synthesis test passed for both voices (runner proxy)." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::pip could not install sherpa-onnx==$SHERPA_VERSION - runner synthesis test SKIPPED. Use the in-app selfTestAll on the phone."
+            echo "- Runner synthesis test SKIPPED (python wheel not installable)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Add sherpa-onnx Android library and the native SherpaTts plugin
         run: |
           set -e
           mkdir -p android/app/libs
-          curl -fL --retry 3 -o "android/app/libs/$SHERPA_AAR" "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$SHERPA_VERSION/$SHERPA_AAR"
-          got=$(stat -c %s "android/app/libs/$SHERPA_AAR")
-          [ "$got" = "$SHERPA_AAR_BYTES" ] || { echo "::error::AAR size $got != $SHERPA_AAR_BYTES"; exit 1; }
+          AAR="android/app/libs/$SHERPA_AAR"
+          curl -fL --retry 3 -o "$AAR" "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$SHERPA_VERSION/$SHERPA_AAR"
+          SIZE=$(stat -c %s "$AAR"); SHA=$(sha256sum "$AAR" | cut -d' ' -f1)
+          {
+            echo "### Sherpa AAR"
+            echo "- file: $SHERPA_AAR"
+            echo "- size: $SIZE bytes"
+            echo "- sha256: \`$SHA\` (paste into SHERPA_AAR_SHA256 in this workflow to pin it)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$SIZE" -gt 10000000 ] || { echo "::error::AAR is only $SIZE bytes - download is not the real library"; exit 1; }
+          if [ -n "$SHERPA_AAR_SHA256" ]; then
+            [ "$SHA" = "$SHERPA_AAR_SHA256" ] || { echo "::error::AAR sha256 $SHA != pinned $SHERPA_AAR_SHA256"; exit 1; }
+          fi
+          unzip -tq "$AAR" >/dev/null || { echo "::error::AAR is not a valid zip"; exit 1; }
+          # native libraries for both ABIs we ship
           for abi in arm64-v8a armeabi-v7a; do
-            unzip -l "android/app/libs/$SHERPA_AAR" | grep -q "jni/$abi/libsherpa-onnx-jni.so" || { echo "::error::AAR has no $abi native library"; exit 1; }
+            unzip -l "$AAR" | grep -q "jni/$abi/libsherpa-onnx-jni.so" || { echo "::error::AAR has no $abi native library (libsherpa-onnx-jni.so)"; exit 1; }
           done
+          # Java/Kotlin API check: every method the plugin calls must exist in this AAR (fails BEFORE the long Gradle build)
+          rm -rf /tmp/aar && mkdir -p /tmp/aar && unzip -q "$AAR" classes.jar -d /tmp/aar
+          J=/tmp/aar/classes.jar
+          api() { javap -cp "$J" "$1" 2>/dev/null; }
+          chk() { api "$1" | grep -q "$2" || { echo "::error::sherpa-onnx $SHERPA_VERSION AAR: $1 has no '$2' - the plugin does not match this AAR"; exit 1; }; }
+          chk com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig setModel
+          chk com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig setTokens
+          chk com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig setDataDir
+          chk com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig setNoiseScale
+          chk com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig setNoiseScaleW
+          chk com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig setLengthScale
+          chk com.k2fsa.sherpa.onnx.OfflineTtsModelConfig setVits
+          chk com.k2fsa.sherpa.onnx.OfflineTtsModelConfig setNumThreads
+          chk com.k2fsa.sherpa.onnx.OfflineTtsModelConfig setDebug
+          chk com.k2fsa.sherpa.onnx.OfflineTtsModelConfig setProvider
+          chk com.k2fsa.sherpa.onnx.OfflineTtsConfig setModel
+          chk com.k2fsa.sherpa.onnx.OfflineTtsConfig setMaxNumSentences
+          chk com.k2fsa.sherpa.onnx.OfflineTts "android.content.res.AssetManager"
+          chk com.k2fsa.sherpa.onnx.OfflineTts " generate("
+          chk com.k2fsa.sherpa.onnx.OfflineTts sampleRate
+          chk com.k2fsa.sherpa.onnx.OfflineTts release
+          chk com.k2fsa.sherpa.onnx.GeneratedAudio getSamples
+          chk com.k2fsa.sherpa.onnx.GeneratedAudio getSampleRate
+          echo "- Java/Kotlin API check against the AAR: all methods used by SherpaTtsPlugin exist" | tee -a "$GITHUB_STEP_SUMMARY"
           PKG=android/app/src/main/java/com/rohanchauhan/tradesjournal
           mkdir -p "$PKG"
           cp SherpaTtsPlugin.java "$PKG/SherpaTtsPlugin.java"
@@ -249,19 +342,30 @@ jobs:
         run: |
           npm ls @capacitor-community/speech-recognition --depth=0
           npm ls @capacitor-community/text-to-speech --depth=0
+          test -s voice-bridge-entry.js
           test -s www/voice-bridge.js
           grep -q RCTextToSpeech www/voice-bridge.js
           grep -q RCSpeechRecognition www/voice-bridge.js
           for f in va-nlu va-io va-app va-core va-ui va-brain va-pro va-piper; do test -s www/$f.js; done
           test -d node_modules/@capacitor-community/speech-recognition/android
           test -d node_modules/@capacitor-community/text-to-speech/android
-          grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
-          grep -q RecognitionService android/app/src/main/AndroidManifest.xml
+          M=android/app/src/main/AndroidManifest.xml
+          for perm in RECORD_AUDIO MODIFY_AUDIO_SETTINGS INTERNET; do grep -q "android.permission.$perm" "$M" || { echo "::error::Manifest permission missing: $perm"; exit 1; }; done
+          grep -q RecognitionService "$M"
           V=android/app/src/main/assets/voices
-          test -s "$V/$HI_VOICE/$HI_VOICE.onnx" && test -s "$V/$EN_VOICE/$EN_VOICE.onnx" && test -d "$V/espeak-ng-data" || { echo "::error::Piper voice files are missing before the build"; exit 1; }
-          test -s android/app/src/main/java/com/rohanchauhan/tradesjournal/SherpaTtsPlugin.java
-          grep -q "registerPlugin(SherpaTtsPlugin.class)" android/app/src/main/java/com/rohanchauhan/tradesjournal/MainActivity.java
-          echo "Plugins, bridge, voice modules, Piper assets and manifest entries are present."
+          for f in "$V/$HI_VOICE/$HI_VOICE.onnx" "$V/$HI_VOICE/tokens.txt" "$V/$EN_VOICE/$EN_VOICE.onnx" "$V/$EN_VOICE/tokens.txt" "$V/espeak-ng-data/phondata" "$V/espeak-ng-data/hi_dict" "$V/espeak-ng-data/en_dict"; do
+            test -s "$f" || { echo "::error::Piper voice file missing before the build: $f"; exit 1; }
+          done
+          [ "$ESPEAK_FILES" -ge 20 ] || { echo "::error::only $ESPEAK_FILES espeak-ng-data files"; exit 1; }
+          P=android/app/src/main/java/com/rohanchauhan/tradesjournal
+          test -s "$P/SherpaTtsPlugin.java"
+          grep -q "registerPlugin(SherpaTtsPlugin.class)" "$P/MainActivity.java"
+          # the Sherpa dependency must be 1.13.8 and nothing may still reference 2.x
+          grep -q "sherpa-onnx-static-link-onnxruntime-$SHERPA_VERSION" android/app/build.gradle || { echo "::error::build.gradle does not reference the $SHERPA_VERSION AAR"; exit 1; }
+          test -s "android/app/libs/$SHERPA_AAR"
+          if ls android/app/libs | grep -E "sherpa.*(2\.[0-9]+\.[0-9]+)"; then echo "::error::an old Sherpa 2.x AAR is still in android/app/libs"; exit 1; fi
+          if grep -n "2\.0\.3" android/app/build.gradle; then echo "::error::2.0.3 still referenced in build.gradle"; exit 1; fi
+          echo "Plugins, bridge, voice modules, Piper assets, Sherpa $SHERPA_VERSION dependency and manifest entries are present."
 
       - name: Use the fixed signing key (APK updates over the old one, data stays)
         run: |
@@ -281,8 +385,9 @@ jobs:
           test -s "$APK"
           SIZE=$(stat -c %s "$APK"); echo "APK size: $SIZE bytes"
           [ "$SIZE" -gt 100000000 ] || { echo "::error::APK is only $SIZE bytes - Piper models are not inside it"; exit 1; }
+          [ "$SIZE" -lt 450000000 ] || { echo "::error::APK is $SIZE bytes - unexpectedly huge, something extra was packaged"; exit 1; }
           unzip -l "$APK" > /tmp/apk.txt
-          for f in assets/public/index.html assets/public/voice-bridge.js assets/public/va-brain.js assets/public/va-pro.js assets/public/va-core.js assets/public/va-piper.js \
+          for f in assets/public/index.html assets/public/voice-bridge.js assets/public/va-nlu.js assets/public/va-io.js assets/public/va-app.js assets/public/va-brain.js assets/public/va-pro.js assets/public/va-core.js assets/public/va-ui.js assets/public/va-piper.js \
                    "assets/voices/$HI_VOICE/$HI_VOICE.onnx" "assets/voices/$HI_VOICE/tokens.txt" \
                    "assets/voices/$EN_VOICE/$EN_VOICE.onnx" "assets/voices/$EN_VOICE/tokens.txt" \
                    assets/voices/espeak-ng-data/phondata assets/voices/espeak-ng-data/hi_dict assets/voices/espeak-ng-data/en_dict \
@@ -293,6 +398,7 @@ jobs:
           echo "espeak files: source=$ESPEAK_FILES inside APK=$APK_ESPEAK" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$APK_ESPEAK" = "$ESPEAK_FILES" ] || { echo "::error::espeak-ng-data files were dropped while packaging the APK ($ESPEAK_FILES -> $APK_ESPEAK)"; exit 1; }
           unzip -p "$APK" 'classes*.dex' | strings | grep -q "SherpaTtsPlugin" || { echo "::error::SherpaTtsPlugin class is not in the APK dex"; exit 1; }
+          unzip -p "$APK" 'classes*.dex' | strings | grep -q "com/k2fsa/sherpa/onnx/OfflineTts" || { echo "::error::sherpa-onnx Java classes are not in the APK dex"; exit 1; }
           {
             echo "### APK"
             echo "- size: $((SIZE/1048576)) MB"
@@ -301,7 +407,20 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           keytool -printcert -jarfile "$APK" 2>&1 | grep -E "Owner|SHA256" | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo "APK verified: web files, Piper models, espeak data, native library, plugin class and signature present." | tee -a "$GITHUB_STEP_SUMMARY"
+          # signature: must verify AND match the fixed rc-debug.keystore (otherwise it will not install as an update)
+          APKSIGNER=$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "$APK" > /tmp/sign.txt 2>&1 || { cat /tmp/sign.txt; echo "::error::APK signature does not verify"; exit 1; }
+            GOT=$(grep -i "certificate SHA-256 digest" /tmp/sign.txt | head -1 | sed 's/.*: *//' | tr -d ': ' | tr 'A-F' 'a-f')
+            WANT=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android 2>/dev/null | grep -m1 "SHA256:" | sed 's/.*SHA256: *//' | tr -d ': ' | tr 'A-F' 'a-f')
+            echo "APK signer sha256: $GOT" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "rc-debug.keystore sha256: $WANT" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ -n "$GOT" ] && [ -n "$WANT" ] && [ "$GOT" != "$WANT" ]; then echo "::error::APK is NOT signed with rc-debug.keystore - it would not update your old APK"; exit 1; fi
+            { [ -z "$GOT" ] || [ -z "$WANT" ]; } && echo "::warning::could not compare signing fingerprints automatically"
+          else
+            echo "::warning::apksigner not found on the runner - signature fingerprint check skipped"
+          fi
+          echo "APK verified: web files, Piper models, espeak data, native libraries, plugin class and signature present." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
