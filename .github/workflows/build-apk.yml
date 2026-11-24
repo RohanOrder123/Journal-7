@@ -334,6 +334,9 @@ jobs:
           rep('versionName "1.0"', 'versionName "1.0"\n        ndk { abiFilters \'arm64-v8a\', \'armeabi-v7a\' }');
           rep('compileSdk rootProject.ext.compileSdkVersion', 'compileSdk rootProject.ext.compileSdkVersion\n    androidResources { noCompress \'onnx\' }');
           rep("implementation project(':capacitor-android')", "implementation project(':capacitor-android')\n    implementation(name: '" + process.env.SHERPA_AAR.replace(/\.aar$/, '') + "', ext: 'aar')\n    implementation \"org.jetbrains.kotlin:kotlin-stdlib:1.8.22\"");
+          // sign the debug build with YOUR fixed key (copying it to ~/.android alone is not enough: Gradle ignored it)
+          const ks = (process.env.GITHUB_WORKSPACE || process.cwd()) + '/rc-debug.keystore';
+          rep('buildTypes {', "signingConfigs {\n        debug {\n            storeFile file('" + ks + "')\n            storePassword 'android'\n            keyAlias 'androiddebugkey'\n            keyPassword 'android'\n        }\n    }\n\n    buildTypes {");
           fs.writeFileSync(p, g);
           NODE
           echo "----- android/app/build.gradle -----"; cat android/app/build.gradle
@@ -365,6 +368,7 @@ jobs:
           test -s "android/app/libs/$SHERPA_AAR"
           if ls android/app/libs | grep -E "sherpa.*(2\.[0-9]+\.[0-9]+)"; then echo "::error::an old Sherpa 2.x AAR is still in android/app/libs"; exit 1; fi
           if grep -n "2\.0\.3" android/app/build.gradle; then echo "::error::2.0.3 still referenced in build.gradle"; exit 1; fi
+          grep -q "rc-debug.keystore" android/app/build.gradle || { echo "::error::build.gradle is not set to sign with rc-debug.keystore"; exit 1; }
           echo "Plugins, bridge, voice modules, Piper assets, Sherpa $SHERPA_VERSION dependency and manifest entries are present."
 
       - name: Use the fixed signing key (APK updates over the old one, data stays)
