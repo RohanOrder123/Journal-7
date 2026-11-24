@@ -331,8 +331,12 @@ public class SherpaTtsPlugin extends Plugin {
 
     private AudioTrack openTrack(int sr) {
         int min = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        /* buffer is in BYTES and must be a multiple of the frame size (mono 16-bit = 2 bytes); an odd size
+           throws "Invalid audio buffer size". About 1 second of audio gives smooth playback on slow phones. */
+        int bytes = Math.max(min > 0 ? min * 2 : 0, sr * 2);
+        bytes -= bytes % 2;
         AudioTrack at = new AudioTrack(AudioManager.STREAM_MUSIC, sr, AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, Math.max(min * 2, sr / 2), AudioTrack.MODE_STREAM);
+                AudioFormat.ENCODING_PCM_16BIT, bytes, AudioTrack.MODE_STREAM);
         if (at.getState() != AudioTrack.STATE_INITIALIZED) {
             try { at.release(); } catch (Throwable ignore) { /* ignore */ }
             throw new IllegalStateException("AudioTrack not initialized (sampleRate=" + sr + ")");
