@@ -93,7 +93,7 @@
       const r = await pl.speak({ text: code === 'hi' ? toDeva(text) : text, voice: VOICES[code], speed: rate() });
       if (my === gen) { speaking = false; VA.emit('speaking', false); }
       last.engine = 'piper-' + code; last.ms = Date.now() - t0; last.err = '';
-      log('piper ' + code + ' ok ' + (r && r.interrupted ? '(interrupted) ' : '') + 'first=' + (r && r.firstAudioMs) + 'ms total=' + (r && r.totalMs) + 'ms chunks=' + (r && r.chunks));
+      log('piper ' + code + ' ok ' + (r && r.interrupted ? '(interrupted) ' : '') + 'first=' + (r && r.firstAudioMs) + 'ms total=' + (r && r.totalMs) + 'ms chunks=' + (r && r.chunks) + ' lead=' + (r && r.leadMs) + 'ms rtf=' + (r && r.rtf) + ' threads=' + (r && r.threads) + ' underruns=' + (r && r.underruns));
       return my === gen && !(r && r.interrupted);
     } catch (e) {
       if (my !== gen) return false;                    /* we were interrupted, not broken */
@@ -180,6 +180,7 @@
       '<b style="font-size:16px">आवाज़ / Voice Self-check</b>' +
       '<label style="display:block;margin-top:10px">Voice engine</label><select id="pc-eng" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px"><option value="piper">Piper (offline, default)</option><option value="eleven">ElevenLabs (premium)</option><option value="phone">Phone voice only</option></select>' +
       '<div style="display:flex;gap:8px;margin:6px 0"><button id="pc-hi" style="flex:1;padding:12px;border-radius:10px">Test Hindi</button><button id="pc-en" style="flex:1;padding:12px;border-radius:10px">Test English</button></div>' +
+      '<div style="display:flex;gap:8px;margin:6px 0"><button id="pc-tune" style="flex:1;padding:12px;border-radius:10px;font-weight:700">Speed tune (सिर्फ़ एक बार)</button></div>' +
       '<div style="display:flex;gap:8px;margin:6px 0"><button id="pc-chk" style="flex:1;padding:12px;border-radius:10px;font-weight:700">Self-check</button><button id="pc-copy" style="flex:1;padding:12px;border-radius:10px">Copy report</button><button id="pc-x" style="padding:12px;border-radius:10px">Close</button></div>' +
       '<div id="pc-st" style="min-height:20px;margin:8px 0;font-weight:600"></div>' +
       '<pre id="pc-rep" style="white-space:pre-wrap;word-break:break-word;font:11px/1.4 ui-monospace,monospace;margin:0;opacity:.9"></pre></div>';
@@ -196,14 +197,26 @@
       try {
         const r = await pl.speak({ text: c === 'hi' ? toDeva('नमस्ते ' + (pr.addr || 'रोहन जी') + ', मैं ' + (pr.name || 'वेदा') + ' हूँ। अब मेरी आवाज़ कैसी लग रही है?') : 'Hello ' + (pr.addr || 'Rohan ji') + ', I am ' + (pr.name || 'Veda') + '. How does my voice sound now?', voice: VOICES[c], speed: rate() });
         if (my === gen) { speaking = false; VA.emit('speaking', false); }
-        log('test ' + c + ' ok first=' + (r && r.firstAudioMs) + 'ms');
-        st(r && r.interrupted ? 'रोक दिया गया।' : '✓ चली: शुरू होने में ' + (r.firstAudioMs) + ' ms, कुल ' + (r.totalMs) + ' ms');
+        log('test ' + c + ' ok first=' + (r && r.firstAudioMs) + 'ms lead=' + (r && r.leadMs) + 'ms rtf=' + (r && r.rtf) + ' threads=' + (r && r.threads) + ' underruns=' + (r && r.underruns));
+        st(r && r.interrupted ? 'रोक दिया गया।' : '✓ चली: शुरू होने में ' + (r.firstAudioMs) + ' ms, कुल ' + (r.totalMs) + ' ms, रुकावट ' + (r.underruns) + ', RTF ' + (r.rtf) + ', threads ' + (r.threads));
       } catch (e) {
         if (my === gen) { speaking = false; VA.emit('speaking', false); }
         log('test ' + c + ' FAILED ' + (e && e.code) + ' ' + (e && e.message));
         st('✗ ' + hiMsg(e).replace(' अभी दूसरी आवाज़ चल रही है।', ''), true);
       }
     }
+    $('pc-tune').onclick = async function () {
+      const pl = P(); if (!pl || !pl.tune) return st('Piper plugin नहीं मिला (पुराना APK?) — नया APK इंस्टॉल करें।', true);
+      tts.stop(); $('pc-rep').textContent = '';
+      st('Speed tune चल रहा है... 1-2 मिनट लगेंगे, फ़ोन थोड़ा गरम हो सकता है। ऐप बंद न करें, स्क्रीन चालू रखें।');
+      try {
+        const r = await withTimeout(pl.tune(), 300000, 'tune');
+        const rows = (r.table || []).map(function (x) { return 'threads ' + x.threads + ': ' + x.synthMs + ' ms, audio ' + x.audioSec + ' s, RTF ' + x.rtf; });
+        $('pc-rep').textContent = 'फ़ोन के cores: ' + r.cores + '\n' + rows.join('\n') + '\nचुना गया: ' + r.best + ' threads (RTF ' + r.bestRtf + ')';
+        log('tune best=' + r.best + ' rtf=' + r.bestRtf);
+        st('✓ हो गया: ' + r.best + ' threads सेव। RTF जितना कम, आवाज़ उतनी जल्दी और बिना रुके। अब Test Hindi दबाकर देखें।');
+      } catch (e) { st('✗ Speed tune नहीं चला: ' + (e && e.message || e), true); }
+    };
     $('pc-hi').onclick = function () { testVoice('hi'); };
     $('pc-en').onclick = function () { testVoice('en'); };
     $('pc-chk').onclick = async function () {
@@ -228,4 +241,5 @@
 
   /* warm up the Hindi voice shortly after start so the first reply is fast */
   setTimeout(function () { const pl = P(); if (pl && pl.preload && (pr.engine || 'piper') === 'piper') pl.preload({ voice: VOICES.hi }).catch(function (e) { log('preload hi FAILED ' + (e && e.code) + ' ' + (e && e.message)); }); }, 2500);
+  setTimeout(function () { const pl = P(); if (pl && pl.preload && (pr.engine || 'piper') === 'piper') pl.preload({ voice: VOICES.en }).catch(function (e) { log('preload en FAILED ' + (e && e.code) + ' ' + (e && e.message)); }); }, 9000);
 })();
