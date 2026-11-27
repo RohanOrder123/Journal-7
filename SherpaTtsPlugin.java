@@ -1,5 +1,7 @@
 package com.rohanchauhan.tradesjournal;
 
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
 import android.media.AudioFormat;
@@ -8,6 +10,7 @@ import android.media.AudioTrack;
 import android.os.Build;
 import android.os.SystemClock;
 
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -29,46 +32,51 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Offline Piper voices through sherpa-onnx 1.13.8 (VITS / Piper models).
+ * Offline Piper voices through sherpa-onnx 1.13.8 (VITS / Piper models).   (plugin version v4)
  *
- * IMPORTANT (v3): this plugin is written for sherpa-onnx 1.x (target: 1.13.8).
- * In 1.x the AAR contains the built-in eSpeak-NG / piper-phonemize frontend, so a Piper model only needs
- * model + tokens.txt + dataDir (= the espeak-ng-data folder) and generate() accepts RAW TEXT.
- * In sherpa-onnx 2.x that frontend was removed (upstream PR #4055) - Piper voices then fail with
- * "phoneme_codepoints is empty, no lexicon, and no frontend available". Do NOT upgrade the AAR to 2.x
- * without also adding a lexicon.txt for each voice.
+ * sherpa-onnx 1.x contains the built-in eSpeak-NG / piper-phonemize frontend, so a Piper model only needs
+ * model + tokens.txt + dataDir (= espeak-ng-data) and generate() accepts raw text. In sherpa-onnx 2.x that
+ * frontend was removed - do NOT upgrade the AAR to 2.x without adding a lexicon.txt per voice.
+ *
+ * v4 = smooth, professional playback on slow phones:
+ *   - ADAPTIVE PRE-BUFFER: playback starts only when enough audio is already synthesized that the rest can be
+ *     produced in time (measured real-time factor of THIS phone). No more "few words, long pause, few words".
+ *   - more CPU threads (auto by core count, and a one-time speed test: tune()).
+ *   - clearer voice: calmer noise settings, loudness normalisation, 6 ms fades between chunks, natural pauses
+ *     after sentences, text cleaner (emoji / markdown / symbols are not sent to the phonemizer).
+ *   - shorter first chunk so speech starts sooner; underrun counter reported to JS.
  *
  * Models live inside the APK:   assets/voices/<voiceId>/<voiceId>.onnx  +  tokens.txt
- * Shared phonemizer data:       assets/voices/espeak-ng-data/   (copied once to filesDir, because espeak needs real files)
- *
- * Because espeak needs a real dataDir on disk, sherpa is created with a NULL AssetManager and reads model +
- * tokens + espeak-ng-data ALL from the file system. So model and tokens are also copied once to
- * filesDir/voices/<voiceId>/.
+ * Shared phonemizer data:       assets/voices/espeak-ng-data/   (copied once to filesDir)
  *
  * JS API (window.Capacitor.Plugins.SherpaTts):
- *   status()                      -> what is in the APK, native library state
- *   selfTest({voice,text})        -> load + synthesize (no playback); checks samples, rate, peak, phonemizer log
- *   selfTestAll()                 -> NEW: runs the Hindi AND the English self-test and reports both
+ *   status()                      -> what is in the APK, native library state, current settings
+ *   selfTest({voice,text})        -> load + synthesize (no playback)
+ *   selfTestAll()                 -> Hindi AND English self-test
  *   speak({voice,text,speed})     -> plays natively; resolves when finished OR interrupted (never hangs)
  *   stop()                        -> stops playback, resolves the pending speak() immediately
  *   preload({voice})              -> loads a voice into memory
+ *   tune()                        -> NEW: measures 2/3/4/6 threads on this phone and keeps the fastest
+ *   config({threads,noiseScale,noiseScaleW,reset}) -> NEW: change / reset the saved settings
  * Error codes: NO_ASSET, NATIVE_LIB, INIT_FAIL, GEN_FAIL, NO_AUDIO, BAD_ARGS
  */
 @CapacitorPlugin(name = "SherpaTts")
@@ -76,14 +84,21 @@ public class SherpaTtsPlugin extends Plugin {
 
     private static final String ESPEAK_MARK = "espeak-ok-v1";
     private static final String TARGET_SHERPA = "1.13.8";
-    private static final boolean SHERPA_DEBUG = true; /* sherpa prints its own errors to logcat; selfTest reads them back */
-    private static final float[] END = new float[0];
+    private static final boolean SHERPA_DEBUG = false;
+    private static final String CFG = "sherpa_tts_cfg";
+
+    private static final double MIN_LEAD_SEC = 0.5;      /* never start with less audio than this ... */
+    private static final double MAX_LEAD_SEC = 40.0;     /* ... and never ask for more than this */
+    private static final long MAX_PREBUFFER_MS = 22000;  /* start anyway after this long (user must hear something) */
+    private static final int MAX_QUEUED_SEC = 90;        /* memory cap for synthesized-but-not-yet-played audio */
 
     static final String HI_VOICE = "hi_IN-priyamvada-medium";
     static final String EN_VOICE = "en_US-amy-medium";
     /* Hindi test sentence is written with \\u escapes so the file is safe with any compiler encoding */
     static final String HI_TEST = "\u0928\u092e\u0938\u094d\u0924\u0947 \u0930\u094b\u0939\u0928 \u091c\u0940, \u092e\u0948\u0902 \u0935\u0947\u0926\u093e \u0939\u0942\u0901\u0964 \u092f\u0939 \u0939\u093f\u0902\u0926\u0940 \u0906\u0935\u093e\u091c\u093c \u0915\u093e \u092a\u0930\u0940\u0915\u094d\u0937\u0923 \u0939\u0948\u0964";
     static final String EN_TEST = "Hello Rohan ji, this is an offline English voice test.";
+    private static final String HI_PERCENT = " \u092a\u094d\u0930\u0924\u093f\u0936\u0924 ";
+    private static final String HI_AND = " \u0914\u0930 ";
 
     /* the exact messages sherpa prints when the text -> phoneme -> token frontend is missing or fails */
     private static final String[] PHONEMIZER_MARKERS = {
@@ -95,6 +110,7 @@ public class SherpaTtsPlugin extends Plugin {
     private final ExecutorService exec = Executors.newSingleThreadExecutor();
     private final AtomicInteger gen = new AtomicInteger();
     private final Map<String, OfflineTts> engines = new ConcurrentHashMap<>();
+    private final Map<String, Float> peaks = new ConcurrentHashMap<>();
     private final Object trackLock = new Object();
     private AudioTrack track;
     private volatile Run current;
@@ -132,6 +148,28 @@ public class SherpaTtsPlugin extends Plugin {
             if (done.compareAndSet(false, true)) call.reject(msg, code);
         }
     }
+
+    /** a piece of text with the pause that follows it */
+    static class Chunk {
+        final String text;
+        final int pauseMs;
+        Chunk(String t, int p) {
+            text = t;
+            pauseMs = p;
+        }
+    }
+
+    /** synthesized audio with the pause that follows it */
+    private static class Item {
+        final float[] s;
+        final int pauseMs;
+        Item(float[] s, int p) {
+            this.s = s;
+            this.pauseMs = p;
+        }
+    }
+
+    private static final Item END_ITEM = new Item(new float[0], 0);
 
     private static long since(long t0) {
         return SystemClock.elapsedRealtime() - t0;
@@ -187,6 +225,56 @@ public class SherpaTtsPlugin extends Plugin {
         f.delete();
     }
 
+    /* ---------------------------------------------------------------- saved settings */
+
+    private SharedPreferences prefs() {
+        return getContext().getSharedPreferences(CFG, Context.MODE_PRIVATE);
+    }
+
+    private static int cores() {
+        return Math.max(1, Runtime.getRuntime().availableProcessors());
+    }
+
+    private static int defaultThreads() {
+        int c = cores();
+        return c >= 6 ? 4 : (c >= 4 ? 3 : 2);
+    }
+
+    private int threads() {
+        int t = prefs().getInt("threads", defaultThreads());
+        return Math.max(1, Math.min(8, t));
+    }
+
+    private float noiseScale() {
+        return prefs().getFloat("noise", 0.55f);
+    }
+
+    private float noiseScaleW() {
+        return prefs().getFloat("noisew", 0.7f);
+    }
+
+    private JSObject cfgJson() {
+        JSObject o = new JSObject();
+        o.put("threads", threads());
+        o.put("cores", cores());
+        o.put("noiseScale", noiseScale());
+        o.put("noiseScaleW", noiseScaleW());
+        return o;
+    }
+
+    /** releases every loaded voice so the next use rebuilds it with the current settings */
+    private synchronized void dropEngines() {
+        for (OfflineTts t : engines.values()) {
+            try { t.release(); } catch (Throwable ignore) { /* ignore */ }
+        }
+        engines.clear();
+        synchronized (cache) {
+            cache.clear();
+        }
+    }
+
+    /* ---------------------------------------------------------------- files */
+
     /** espeak-ng-data is copied once; a marker file proves the copy finished (survives app restarts). */
     private synchronized String ensureEspeak() throws VoiceErr {
         if (espeakDir != null) return espeakDir;
@@ -238,9 +326,8 @@ public class SherpaTtsPlugin extends Plugin {
         return dir;
     }
 
-    private synchronized OfflineTts load(String id) throws VoiceErr {
-        OfflineTts t = (id == null) ? null : engines.get(id);
-        if (t != null) return t;
+    /** builds one engine with the given thread count (does not touch the engines map) */
+    private OfflineTts buildEngine(String id, int threads) throws VoiceErr {
         if (id == null || !id.matches("[A-Za-z0-9_\\-]+")) throw new VoiceErr("BAD_ARGS", "bad voice id");
         AssetManager am = getContext().getAssets();
         String dir = "voices/" + id;
@@ -251,18 +338,19 @@ public class SherpaTtsPlugin extends Plugin {
         }
         String espeak = ensureEspeak();
         File vd = ensureVoiceFiles(id);
+        OfflineTts t = null;
         try {
             /* sherpa-onnx 1.x Piper config: model + tokens + dataDir(espeak-ng-data). No lexicon needed. */
             OfflineTtsVitsModelConfig v = new OfflineTtsVitsModelConfig();
             v.setModel(new File(vd, id + ".onnx").getAbsolutePath());
             v.setTokens(new File(vd, "tokens.txt").getAbsolutePath());
             v.setDataDir(espeak);
-            v.setNoiseScale(0.667f);
-            v.setNoiseScaleW(0.8f);
+            v.setNoiseScale(noiseScale());
+            v.setNoiseScaleW(noiseScaleW());
             v.setLengthScale(1.0f);
             OfflineTtsModelConfig m = new OfflineTtsModelConfig();
             m.setVits(v);
-            m.setNumThreads(2);
+            m.setNumThreads(threads);
             m.setDebug(SHERPA_DEBUG);
             m.setProvider("cpu");
             OfflineTtsConfig c = new OfflineTtsConfig();
@@ -278,6 +366,13 @@ public class SherpaTtsPlugin extends Plugin {
             String why = e.getClass().getSimpleName() + ": " + e.getMessage();
             throw new VoiceErr(e instanceof LinkageError ? "NATIVE_LIB" : "INIT_FAIL", why);
         }
+        return t;
+    }
+
+    private synchronized OfflineTts load(String id) throws VoiceErr {
+        OfflineTts t = (id == null) ? null : engines.get(id);
+        if (t != null) return t;
+        t = buildEngine(id, threads());
         engines.put(id, t);
         return t;
     }
@@ -301,9 +396,44 @@ public class SherpaTtsPlugin extends Plugin {
         return s;
     }
 
-    /** Sentence / clause splitting so the next chunk can be synthesized while the current one plays. */
-    static List<String> split(String s) {
-        List<String> out = new ArrayList<>();
+    /* ---------------------------------------------------------------- text preparation */
+
+    /**
+     * Removes everything the phonemizer cannot pronounce (emoji, markdown signs, links, symbols) so it never
+     * produces garbage sounds or silent gaps, and spells out % and &amp;.
+     */
+    static String clean(String in, boolean hindi) {
+        if (in == null) return "";
+        String s = in.replaceAll("https?://\\S+", " ");
+        StringBuilder b = new StringBuilder(s.length());
+        int i = 0;
+        while (i < s.length()) {
+            int cp = s.codePointAt(i);
+            i += Character.charCount(cp);
+            if (cp == '\n') { b.append('\n'); continue; }
+            if (cp == '\r' || cp == '\t') { b.append(' '); continue; }
+            if (cp == '%') { b.append(hindi ? HI_PERCENT : " percent "); continue; }
+            if (cp == '&') { b.append(hindi ? HI_AND : " and "); continue; }
+            if ("*#_~`|<>[]{}\\^=@/()+\"\u201c\u201d\u2022\u00b7\u25ba\u25b6\u2192\u2190\u2191\u2193".indexOf(cp) >= 0) { b.append(' '); continue; }
+            int type = Character.getType(cp);
+            if (type == Character.CONTROL || type == Character.PRIVATE_USE || type == Character.SURROGATE
+                    || type == Character.UNASSIGNED || type == Character.OTHER_SYMBOL || type == Character.MODIFIER_SYMBOL) {
+                b.append(' ');
+                continue;
+            }
+            if (cp >= 0xFE00 && cp <= 0xFE0F) continue;                      /* emoji variation selectors */
+            if (type == Character.FORMAT && cp != 0x200C && cp != 0x200D) { continue; }
+            b.appendCodePoint(cp);
+        }
+        return b.toString().replaceAll("[ ]{2,}", " ").replaceAll("[ ]+([.,!?;:\u0964])", "$1").replaceAll(" *\n *", "\n").trim();
+    }
+
+    /**
+     * Sentence / clause splitting. The FIRST chunk is short so speech starts early; later chunks are longer
+     * for natural flow. Every chunk carries the pause that is played after it.
+     */
+    static List<Chunk> split(String s) {
+        List<Chunk> out = new ArrayList<>();
         StringBuilder b = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
             char ch = s.charAt(i);
@@ -311,23 +441,30 @@ public class SherpaTtsPlugin extends Plugin {
             boolean decimal = ch == '.' && i > 0 && i + 1 < s.length()
                     && Character.isDigit(s.charAt(i - 1)) && Character.isDigit(s.charAt(i + 1));
             boolean hard = !decimal && (ch == '\u0964' || ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n');
-            boolean soft = (ch == ',' || ch == ':') && b.length() > 140;
-            if (hard || soft || b.length() >= 220) flush(out, b);
+            int softAt = out.isEmpty() ? 45 : 80;
+            boolean soft = (ch == ',' || ch == ':') && b.length() > softAt;
+            boolean longSpace = ch == ' ' && b.length() >= 120;
+            boolean overflow = b.length() >= 200;
+            if (hard) flush(out, b, (ch == '?' || ch == '!') ? 190 : (ch == ';' ? 120 : 170));
+            else if (soft) flush(out, b, 70);
+            else if (longSpace || overflow) flush(out, b, 40);
         }
-        flush(out, b);
+        flush(out, b, 170);
         return out;
     }
 
-    private static void flush(List<String> out, StringBuilder b) {
+    private static void flush(List<Chunk> out, StringBuilder b, int pauseMs) {
         String t = b.toString().trim();
         b.setLength(0);
         for (int i = 0; i < t.length(); i++) {
             if (Character.isLetterOrDigit(t.charAt(i))) {
-                out.add(t);
+                out.add(new Chunk(t, pauseMs));
                 return;
             }
         }
     }
+
+    /* ---------------------------------------------------------------- audio output */
 
     private AudioTrack openTrack(int sr) {
         int min = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
@@ -361,22 +498,59 @@ public class SherpaTtsPlugin extends Plugin {
         try { t.release(); } catch (Throwable e) { /* ignore */ }
     }
 
-    /** returns false when the write failed or the speech was interrupted */
-    private boolean writeSamples(AudioTrack at, float[] s, int my) {
-        short[] buf = new short[Math.min(s.length, 2048)];
+    private void notePeak(String voice, float pk) {
+        Float old = peaks.get(voice);
+        if (old == null || pk > old) peaks.put(voice, pk);
+    }
+
+    /** one fixed gain per voice so loudness is even between chunks and replies (quiet voices are lifted) */
+    private float gainFor(String voice) {
+        Float pk = peaks.get(voice);
+        if (pk == null) return 1f;
+        float g = 0.92f / Math.max(pk, 0.05f);
+        return Math.max(0.8f, Math.min(2.2f, g));
+    }
+
+    /**
+     * Writes one chunk (with 6 ms fade in/out so chunks join without clicks) and then its pause as silence.
+     * Returns the number of frames written, or -1 when interrupted / the write failed.
+     */
+    private long writeItem(AudioTrack at, Item it, float gain, int sr, int my) {
+        float[] s = it.s;
+        short[] buf = new short[2048];
+        int fade = Math.max(1, sr * 6 / 1000);
+        long frames = 0;
         int pos = 0;
         while (pos < s.length) {
-            if (gen.get() != my) return false;
+            if (gen.get() != my) return -1;
             int n = Math.min(buf.length, s.length - pos);
             for (int i = 0; i < n; i++) {
-                float v = s[pos + i] * 32767f;
-                buf[i] = (short) (v > 32767f ? 32767 : (v < -32768f ? -32768 : v));
+                int idx = pos + i;
+                float v = s[idx] * gain;
+                if (idx < fade) v *= (float) idx / fade;
+                int fromEnd = s.length - 1 - idx;
+                if (fromEnd < fade) v *= (float) fromEnd / fade;
+                if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
+                buf[i] = (short) (v * 32767f);
             }
             int w = at.write(buf, 0, n);
-            if (w < 0) return false;
+            if (w < 0) return -1;
             pos += n;
+            frames += n;
         }
-        return true;
+        long sil = (long) sr * it.pauseMs / 1000;
+        if (sil > 0) {
+            short[] zeros = new short[2048];
+            while (sil > 0) {
+                if (gen.get() != my) return -1;
+                int n = (int) Math.min(zeros.length, sil);
+                int w = at.write(zeros, 0, n);
+                if (w < 0) return -1;
+                sil -= n;
+                frames += n;
+            }
+        }
+        return frames;
     }
 
     private JSObject interrupted() {
@@ -386,6 +560,23 @@ public class SherpaTtsPlugin extends Plugin {
         return o;
     }
 
+    /**
+     * How many seconds of audio must already be synthesized before playback may start, so that the REST of the
+     * text can be produced in time. Uses the real-time factor measured on this phone during this very reply.
+     */
+    private static double needSec(int sr, long[] chars, long totalChars, int done, long charsDone,
+                                  long statChars, long statSamples, long statMs) {
+        if (statChars <= 0 || statSamples <= 0 || sr <= 0) return MIN_LEAD_SEC;
+        double audioSec = statSamples / (double) sr;
+        double rtf = (statMs / 1000.0) / audioSec;
+        double secPerChar = audioSec / statChars;
+        double remAudio = Math.max(0L, totalChars - charsDone) * secPerChar;
+        double remSynth = remAudio * rtf;
+        double nextChars = (done >= 0 && done < chars.length) ? chars[done] : 0;
+        double nextSynth = nextChars * secPerChar * rtf;
+        double need = Math.max(MIN_LEAD_SEC, Math.max(nextSynth * 1.25, remSynth - remAudio)) + 0.3;
+        return Math.min(need, MAX_LEAD_SEC);
+    }
 
     /* ------------------------------------------------------------ diagnostics */
 
@@ -532,6 +723,7 @@ public class SherpaTtsPlugin extends Plugin {
         o.put("audioSec", Math.round(secs * 100) / 100.0);
         o.put("peak", Math.round(peak * 1000) / 1000.0);
         o.put("rtf", secs > 0 ? Math.round(genMs / 1000.0 / secs * 100) / 100.0 : -1);
+        o.put("threads", threads());
         o.put("phonemizerOk", phon.isEmpty());
         if (!phon.isEmpty()) o.put("phonemizerErrors", phon);
         if (!ok) o.put("diag", diag(t, a, lines));
@@ -552,6 +744,7 @@ public class SherpaTtsPlugin extends Plugin {
         for (String a : Build.SUPPORTED_ABIS) abis.append(abis.length() > 0 ? "," : "").append(a);
         o.put("abis", abis.toString());
         o.put("targetSherpa", TARGET_SHERPA);
+        o.put("settings", cfgJson());
         try {
             Class.forName("com.k2fsa.sherpa.onnx.OfflineTts"); /* runs the static initializer = loads the native library */
             o.put("nativeOk", true);
@@ -598,6 +791,88 @@ public class SherpaTtsPlugin extends Plugin {
                 call.reject(e.getMessage(), e.code);
             } catch (Throwable e) {
                 call.reject(String.valueOf(e), "INIT_FAIL");
+            }
+        });
+    }
+
+    /** Changes / resets the saved settings. Loaded voices are released and rebuilt on next use. */
+    @PluginMethod
+    public void config(final PluginCall call) {
+        exec.execute(() -> {
+            try {
+                SharedPreferences.Editor ed = prefs().edit();
+                if (Boolean.TRUE.equals(call.getBoolean("reset"))) ed.clear();
+                Integer th = call.getInt("threads");
+                if (th != null) ed.putInt("threads", Math.max(1, Math.min(8, th)));
+                Float ns = call.getFloat("noiseScale");
+                if (ns != null) ed.putFloat("noise", Math.max(0.1f, Math.min(1.0f, ns)));
+                Float nw = call.getFloat("noiseScaleW");
+                if (nw != null) ed.putFloat("noisew", Math.max(0.1f, Math.min(1.0f, nw)));
+                ed.apply();
+                dropEngines();
+                JSObject o = cfgJson();
+                o.put("ok", true);
+                call.resolve(o);
+            } catch (Throwable e) {
+                call.reject(e.getClass().getSimpleName() + ": " + e.getMessage(), "INIT_FAIL");
+            }
+        });
+    }
+
+    /**
+     * One-time speed test on THIS phone: builds the English voice with 2 / 3 / 4 / 6 threads (as far as the phone
+     * has cores), times the same sentence and keeps the fastest setting (a bigger thread count must be at least
+     * 8% faster to win). Takes about 1-2 minutes.
+     */
+    @PluginMethod
+    public void tune(final PluginCall call) {
+        exec.execute(() -> {
+            try {
+                gen.incrementAndGet();
+                killTrack();
+                dropEngines();
+                int cores = cores();
+                int[] cand = {2, 3, 4, 6};
+                JSArray table = new JSArray();
+                int best = 0;
+                double bestRtf = Double.MAX_VALUE;
+                for (int th : cand) {
+                    if (th > cores) continue;
+                    OfflineTts e = buildEngine(EN_VOICE, th);
+                    try {
+                        e.generate("Hello.", 0, 1.0f);                       /* warm-up, not timed */
+                        long t1 = SystemClock.elapsedRealtime();
+                        GeneratedAudio a = e.generate(EN_TEST, 0, 1.0f);
+                        long ms = since(t1);
+                        double secs = (a == null || a.getSamples() == null) ? 0 : a.getSamples().length / (double) Math.max(1, a.getSampleRate());
+                        double rtf = secs > 0 ? ms / 1000.0 / secs : 99;
+                        JSObject row = new JSObject();
+                        row.put("threads", th);
+                        row.put("synthMs", ms);
+                        row.put("audioSec", Math.round(secs * 100) / 100.0);
+                        row.put("rtf", Math.round(rtf * 100) / 100.0);
+                        table.put(row);
+                        if (best == 0 || rtf < bestRtf * 0.92) {
+                            best = th;
+                            bestRtf = rtf;
+                        }
+                    } finally {
+                        try { e.release(); } catch (Throwable ignore) { /* ignore */ }
+                    }
+                }
+                if (best == 0) throw new VoiceErr("INIT_FAIL", "no thread setting could be tested");
+                prefs().edit().putInt("threads", best).apply();
+                JSObject o = new JSObject();
+                o.put("ok", true);
+                o.put("best", best);
+                o.put("bestRtf", Math.round(bestRtf * 100) / 100.0);
+                o.put("cores", cores);
+                o.put("table", table);
+                call.resolve(o);
+            } catch (VoiceErr e) {
+                call.reject(e.getMessage(), e.code);
+            } catch (Throwable e) {
+                call.reject(e.getClass().getSimpleName() + ": " + e.getMessage(), "GEN_FAIL");
             }
         });
     }
@@ -695,7 +970,7 @@ public class SherpaTtsPlugin extends Plugin {
 
     private void runSpeak(Run run, final int my, final String voice, String text, final float speed) {
         final long wall0 = System.currentTimeMillis() - 1000;
-        long t0 = SystemClock.elapsedRealtime();
+        final long t0 = SystemClock.elapsedRealtime();
         final OfflineTts t;
         try {
             t = load(voice);
@@ -704,68 +979,150 @@ public class SherpaTtsPlugin extends Plugin {
             return;
         }
         final long initMs = since(t0);
-        final List<String> chunks = split(text);
-        if (chunks.isEmpty() || gen.get() != my) {
+        final List<Chunk> chunks = split(clean(text, voice.startsWith("hi")));
+        if (gen.get() != my) {
             run.ok(interrupted());
             return;
         }
-        final BlockingQueue<float[]> q = new ArrayBlockingQueue<>(2);
+        if (chunks.isEmpty()) {            /* only emoji / symbols: nothing to say, not an error */
+            JSObject none = new JSObject();
+            none.put("ok", true);
+            none.put("interrupted", false);
+            none.put("chunks", 0);
+            run.ok(none);
+            return;
+        }
+        final int sr = t.sampleRate();
+        final int n = chunks.size();
+        final long[] chars = new long[n];
+        long tc = 0;
+        for (int i = 0; i < n; i++) {
+            chars[i] = chunks.get(i).text.length();
+            tc += chars[i];
+        }
+        final long totalChars = tc;
+        final BlockingQueue<Item> q = new LinkedBlockingQueue<>();
+        final AtomicLong queued = new AtomicLong();
+        final AtomicInteger doneIdx = new AtomicInteger();
+        final AtomicLong charsDone = new AtomicLong();
+        final AtomicLong statChars = new AtomicLong();
+        final AtomicLong statSamples = new AtomicLong();
+        final AtomicLong statMs = new AtomicLong();
         final AtomicBoolean abort = new AtomicBoolean(false);
         final AtomicReference<Throwable> perr = new AtomicReference<>();
+        final long queueCap = (long) MAX_QUEUED_SEC * sr;
 
-        /* producer: synthesizes chunk N+1 while chunk N is playing */
+        /* producer: synthesizes chunk N+1 (N+2 ...) while chunk N is playing */
         Thread prod = new Thread(() -> {
             try {
-                for (String c : chunks) {
+                for (int i = 0; i < n; i++) {
                     if (abort.get() || gen.get() != my) break;
-                    float[] s = synth(t, voice, c, speed);
-                    if (s == null || s.length == 0) continue;
-                    while (!q.offer(s, 200, TimeUnit.MILLISECONDS)) {
-                        if (abort.get() || gen.get() != my) return;
+                    boolean stopNow = false;
+                    while (queued.get() > queueCap) {
+                        if (abort.get() || gen.get() != my) { stopNow = true; break; }
+                        Thread.sleep(50);
                     }
+                    if (stopNow) break;
+                    Chunk c = chunks.get(i);
+                    long ts = SystemClock.elapsedRealtime();
+                    float[] s = synth(t, voice, c.text, speed);
+                    long el = since(ts);
+                    doneIdx.incrementAndGet();
+                    charsDone.addAndGet(chars[i]);
+                    if (s == null || s.length == 0) continue;
+                    float pk = 0f;
+                    for (float v : s) pk = Math.max(pk, Math.abs(v));
+                    notePeak(voice, pk);
+                    if (el >= 20) {                  /* a cache hit takes ~0 ms and says nothing about speed */
+                        statChars.addAndGet(chars[i]);
+                        statSamples.addAndGet(s.length);
+                        statMs.addAndGet(el);
+                    }
+                    queued.addAndGet(s.length);
+                    q.offer(new Item(s, c.pauseMs));
                 }
             } catch (Throwable e) {
                 perr.set(e);
             } finally {
-                try {
-                    while (!q.offer(END, 200, TimeUnit.MILLISECONDS)) {
-                        if (abort.get() || gen.get() != my) break;
-                    }
-                } catch (InterruptedException ie) { /* ignore */ }
+                q.offer(END_ITEM);
             }
         }, "sherpa-synth");
         prod.start();
 
         AudioTrack at = null;
         long firstMs = -1;
+        long leadMs = 0;
         long frames = 0;
+        long underruns = -1;
         boolean interrupted = false;
+        boolean ended = false;
+        final ArrayDeque<Item> local = new ArrayDeque<>();
         try {
+            /* phase 1: ADAPTIVE PRE-BUFFER - wait until the rest of the text can be produced before the audio runs out */
+            long bufferedSamples = 0;
+            final long waitStart = SystemClock.elapsedRealtime();
             while (true) {
                 if (gen.get() != my) {
                     interrupted = true;
                     break;
                 }
-                float[] s = q.poll(200, TimeUnit.MILLISECONDS);
-                if (s == null) continue;
-                if (s == END) break;
-                if (at == null) {
-                    at = openTrack(t.sampleRate());
-                    firstMs = since(t0);
+                Item it = q.poll(100, TimeUnit.MILLISECONDS);
+                if (it == END_ITEM) {
+                    ended = true;
+                } else if (it != null) {
+                    local.add(it);
+                    bufferedSamples += it.s.length + (long) it.pauseMs * sr / 1000;
                 }
-                if (!writeSamples(at, s, my)) {
-                    interrupted = true;
-                    break;
+                if (local.isEmpty()) {
+                    if (ended) break;
+                    continue;
                 }
-                frames += s.length;
+                double have = bufferedSamples / (double) sr;
+                double need = needSec(sr, chars, totalChars, doneIdx.get(), charsDone.get(),
+                        statChars.get(), statSamples.get(), statMs.get());
+                if (ended || have >= need || since(waitStart) > MAX_PREBUFFER_MS) break;
             }
-            if (!interrupted && at != null) {
-                at.stop(); /* MODE_STREAM: plays out everything already written */
-                long limit = SystemClock.elapsedRealtime() + (frames * 1000L / Math.max(1, t.sampleRate())) + 1500;
-                while (gen.get() == my && at.getPlaybackHeadPosition() < frames && SystemClock.elapsedRealtime() < limit) {
-                    Thread.sleep(30);
+            leadMs = since(waitStart);
+
+            /* phase 2: play */
+            if (!interrupted && !local.isEmpty()) {
+                at = openTrack(sr);
+                firstMs = since(t0);
+                while (true) {
+                    if (gen.get() != my) {
+                        interrupted = true;
+                        break;
+                    }
+                    Item it = local.poll();
+                    if (it == null) {
+                        if (ended) break;
+                        it = q.poll(100, TimeUnit.MILLISECONDS);
+                        if (it == null) continue;
+                        if (it == END_ITEM) {
+                            ended = true;
+                            break;
+                        }
+                    }
+                    queued.addAndGet(-it.s.length);
+                    long w = writeItem(at, it, gainFor(voice), sr, my);
+                    if (w < 0) {
+                        if (gen.get() != my) interrupted = true;
+                        else perr.compareAndSet(null, new IllegalStateException("AudioTrack write failed"));
+                        break;
+                    }
+                    frames += w;
                 }
-                if (gen.get() != my) interrupted = true;
+                if (!interrupted && perr.get() == null) {
+                    at.stop(); /* MODE_STREAM: plays out everything already written */
+                    long limit = SystemClock.elapsedRealtime() + (frames * 1000L / Math.max(1, sr)) + 1500;
+                    while (gen.get() == my && at.getPlaybackHeadPosition() < frames && SystemClock.elapsedRealtime() < limit) {
+                        Thread.sleep(30);
+                    }
+                    if (gen.get() != my) interrupted = true;
+                }
+                if (Build.VERSION.SDK_INT >= 24) {
+                    try { underruns = at.getUnderrunCount(); } catch (Throwable ignore) { /* ignore */ }
+                }
             }
         } catch (Throwable e) {
             /* stop() releases the AudioTrack while we use it: that is an interruption, not an error */
@@ -792,14 +1149,19 @@ public class SherpaTtsPlugin extends Plugin {
             run.fail("the engine produced no audio" + (phon.isEmpty() ? "" : " | phonemizer: " + phon), "NO_AUDIO");
             return;
         }
+        double audioSec = statSamples.get() / (double) Math.max(1, sr);
         JSObject o = new JSObject();
         o.put("ok", true);
         o.put("interrupted", interrupted);
         o.put("initMs", initMs);
         o.put("firstAudioMs", firstMs);
+        o.put("leadMs", leadMs);
         o.put("totalMs", since(t0));
-        o.put("chunks", chunks.size());
-        o.put("sampleRate", t.sampleRate());
+        o.put("chunks", n);
+        o.put("sampleRate", sr);
+        o.put("underruns", underruns);
+        o.put("rtf", audioSec > 0 ? Math.round(statMs.get() / 1000.0 / audioSec * 100) / 100.0 : -1);
+        o.put("threads", threads());
         run.ok(o);
     }
 }
